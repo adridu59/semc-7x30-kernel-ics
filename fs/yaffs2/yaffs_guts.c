@@ -40,12 +40,13 @@
 static int yaffs_wr_data_obj(struct yaffs_obj *in, int inode_chunk,
 			     const u8 *buffer, int n_bytes, int use_reserve);
 
-
+static void yaffs_fix_null_name(struct yaffs_obj *obj, YCHAR *name,
+				int buffer_size);
 
 /* Function to calculate chunk and offset */
 
-static inline void yaffs_addr_to_chunk(struct yaffs_dev *dev, loff_t addr,
-					int *chunk_out, u32 *offset_out)
+void yaffs_addr_to_chunk(struct yaffs_dev *dev, loff_t addr,
+				int *chunk_out, u32 *offset_out)
 {
 	int chunk;
 	u32 offset;
@@ -177,36 +178,12 @@ void yaffs_release_temp_buffer(struct yaffs_dev *dev, u8 *buffer)
 
 	if (buffer) {
 		/* assume it is an unmanaged one. */
-		yaffs_trace(YAFFS_TRACE_BUFFERS, "Releasing unmanaged temp buffer");
+		yaffs_trace(YAFFS_TRACE_BUFFERS,
+			"Releasing unmanaged temp buffer");
 		kfree(buffer);
 		dev->unmanaged_buffer_deallocs++;
 	}
 
-}
-
-/*
- * Determine if we have a managed buffer.
- */
-int yaffs_is_managed_tmp_buffer(struct yaffs_dev *dev, const u8 *buffer)
-{
-	int i;
-
-	for (i = 0; i < YAFFS_N_TEMP_BUFFERS; i++) {
-		if (dev->temp_buffer[i].buffer == buffer)
-			return 1;
-	}
-
-	for (i = 0; i < dev->param.n_caches; i++) {
-		if (dev->cache[i].data == buffer)
-			return 1;
-	}
-
-	if (buffer == dev->checkpt_buffer)
-		return 1;
-
-	yaffs_trace(YAFFS_TRACE_ALWAYS,
-	  "yaffs: unmaged buffer detected.");
-	return 0;
 }
 
 /*
@@ -218,18 +195,18 @@ static void yaffs_handle_chunk_wr_ok(struct yaffs_dev *dev, int nand_chunk,
 				     const u8 *data,
 				     const struct yaffs_ext_tags *tags)
 {
-	dev = dev;
-	nand_chunk = nand_chunk;
-	data = data;
-	tags = tags;
+	(void) dev;
+	(void) nand_chunk;
+	(void) data;
+	(void) tags;
 }
 
 static void yaffs_handle_chunk_update(struct yaffs_dev *dev, int nand_chunk,
 				      const struct yaffs_ext_tags *tags)
 {
-	dev = dev;
-	nand_chunk = nand_chunk;
-	tags = tags;
+	(void) dev;
+	(void) nand_chunk;
+	(void) tags;
 }
 
 void yaffs_handle_chunk_error(struct yaffs_dev *dev,
@@ -280,7 +257,8 @@ static void yaffs_handle_chunk_wr_error(struct yaffs_dev *dev, int nand_chunk,
 
 static inline int yaffs_hash_fn(int n)
 {
-	n = abs(n);
+	if (n < 0)
+		n = -n;
 	return n % YAFFS_NOBJECT_BUCKETS;
 }
 
@@ -598,7 +576,7 @@ static int yaffs_write_new_chunk(struct yaffs_dev *dev,
 		yaffs_trace(YAFFS_TRACE_ERROR,
 			"**>> yaffs write required %d attempts",
 			attempts);
-		dev->n_retired_writes += (attempts - 1);
+		dev->n_retried_writes += (attempts - 1);
 	}
 
 	return chunk;
@@ -670,15 +648,21 @@ static u16 yaffs_calc_name_sum(const YCHAR *name)
 	return sum;
 }
 
+
 void yaffs_set_obj_name(struct yaffs_obj *obj, const YCHAR * name)
 {
 	memset(obj->short_name, 0, sizeof(obj->short_name));
-	if (name &&
+
+	if (name && !name[0]) {
+		yaffs_fix_null_name(obj, obj->short_name,
+				YAFFS_SHORT_NAME_LENGTH);
+		name = obj->short_name;
+	} else if (name &&
 		strnlen(name, YAFFS_SHORT_NAME_LENGTH + 1) <=
-		YAFFS_SHORT_NAME_LENGTH)
+		YAFFS_SHORT_NAME_LENGTH)  {
 		strcpy(obj->short_name, name);
-	else
-		obj->short_name[0] = _Y('\0');
+	}
+
 	obj->sum = yaffs_calc_name_sum(name);
 }
 
@@ -694,6 +678,14 @@ void yaffs_set_obj_name_from_oh(struct yaffs_obj *obj,
 #else
 	yaffs_set_obj_name(obj, oh->name);
 #endif
+}
+
+loff_t yaffs_max_file_size(struct yaffs_dev *dev)
+{
+	if(sizeof(loff_t) < 8)
+		return YAFFS_MAX_FILE_SIZE_32;
+	else
+		return ((loff_t) YAFFS_MAX_CHUNK_ID) * dev->data_bytes_per_chunk;
 }
 
 /*-------------------- TNODES -------------------
@@ -732,7 +724,7 @@ static void yaffs_deinit_tnodes_and_objs(struct yaffs_dev *dev)
 	dev->n_tnodes = 0;
 }
 
-void yaffs_load_tnode_0(struct yaffs_dev *dev, struct yaffs_tnode *tn,
+static void yaffs_load_tnode_0(struct yaffs_dev *dev, struct yaffs_tnode *tn,
 			unsigned pos, unsigned val)
 {
 	u32 *map = (u32 *) tn;
@@ -809,7 +801,7 @@ struct yaffs_tnode *yaffs_find_tnode_0(struct yaffs_dev *dev,
 	int required_depth;
 	int level = file_struct->top_level;
 
-	dev = dev;
+	(void) dev;
 
 	/* Check sane level and chunk Id */
 	if (level < 0 || level > YAFFS_TNODES_MAX_LEVEL)
@@ -1919,7 +1911,7 @@ struct yaffs_obj *yaffs_find_by_number(struct yaffs_dev *dev, u32 number)
 	return NULL;
 }
 
-struct yaffs_obj *yaffs_new_obj(struct yaffs_dev *dev, int number,
+static struct yaffs_obj *yaffs_new_obj(struct yaffs_dev *dev, int number,
 				enum yaffs_obj_type type)
 {
 	struct yaffs_obj *the_obj = NULL;
@@ -1953,7 +1945,8 @@ struct yaffs_obj *yaffs_new_obj(struct yaffs_dev *dev, int number,
 	case YAFFS_OBJECT_TYPE_FILE:
 		the_obj->variant.file_variant.file_size = 0;
 		the_obj->variant.file_variant.scanned_size = 0;
-		the_obj->variant.file_variant.shrink_size = ~0; /* max */
+		the_obj->variant.file_variant.shrink_size =
+						yaffs_max_file_size(dev);
 		the_obj->variant.file_variant.top_level = 0;
 		the_obj->variant.file_variant.top = tn;
 		break;
@@ -2312,7 +2305,6 @@ alloc_error:
 void yaffs_block_became_dirty(struct yaffs_dev *dev, int block_no)
 {
 	struct yaffs_block_info *bi = yaffs_get_block_info(dev, block_no);
-	unsigned old_state = bi->block_state;
 	int erased_ok = 0;
 	int i;
 
@@ -2376,14 +2368,13 @@ void yaffs_block_became_dirty(struct yaffs_dev *dev, int block_no)
 	/* Clean it up... */
 	bi->block_state = YAFFS_BLOCK_STATE_EMPTY;
 	bi->seq_number = 0;
-	if (old_state != YAFFS_BLOCK_STATE_EMPTY)
-		dev->n_erased_blocks++;
+	dev->n_erased_blocks++;
 	bi->pages_in_use = 0;
 	bi->soft_del_pages = 0;
 	bi->has_shrink_hdr = 0;
 	bi->skip_erased_check = 1;	/* Clean, so no need to check */
 	bi->gc_prioritise = 0;
-	bi->has_summary=0;
+	bi->has_summary = 0;
 
 	yaffs_clear_chunk_bits(dev, block_no);
 
@@ -2498,9 +2489,10 @@ static inline int yaffs_gc_process_chunk(struct yaffs_dev *dev,
 
 			/* Update file size */
 			if (object->variant_type == YAFFS_OBJECT_TYPE_FILE) {
-				oh->file_size =
+				yaffs_oh_size_load(oh,
+				    object->variant.file_variant.file_size);
+				tags.extra_file_size =
 				    object->variant.file_variant.file_size;
-				tags.extra_length = oh->file_size;
 			}
 
 			yaffs_verify_oh(object, oh, &tags, 1);
@@ -3216,6 +3208,7 @@ static void yaffs_load_name_from_oh(struct yaffs_dev *dev, YCHAR *name,
 		}
 	} else {
 #else
+	(void) dev;
 	{
 #endif
 		strncpy(name, oh_name, buff_size - 1);
@@ -3259,9 +3252,10 @@ static void yaffs_load_oh_from_name(struct yaffs_dev *dev, YCHAR *oh_name,
 		}
 	} else {
 #else
+	dev = dev;
 	{
 #endif
-		strncpy(oh_name, name, YAFFS_MAX_NAME_LENGTH);
+		strncpy(oh_name, name, YAFFS_MAX_NAME_LENGTH - 1);
 	}
 }
 
@@ -3284,6 +3278,7 @@ int yaffs_update_oh(struct yaffs_obj *in, const YCHAR *name, int force,
 	u8 *buffer = NULL;
 	YCHAR old_name[YAFFS_MAX_NAME_LENGTH + 1];
 	struct yaffs_obj_hdr *oh = NULL;
+	loff_t file_size = 0;
 
 	strcpy(old_name, _Y("silly old name"));
 
@@ -3336,10 +3331,10 @@ int yaffs_update_oh(struct yaffs_obj *in, const YCHAR *name, int force,
 		/* Should not happen */
 		break;
 	case YAFFS_OBJECT_TYPE_FILE:
-		oh->file_size =
-		    (oh->parent_obj_id == YAFFS_OBJECTID_DELETED ||
-		     oh->parent_obj_id == YAFFS_OBJECTID_UNLINKED) ?
-		     0 : in->variant.file_variant.file_size;
+		if (oh->parent_obj_id != YAFFS_OBJECTID_DELETED &&
+		    oh->parent_obj_id != YAFFS_OBJECTID_UNLINKED)
+			file_size = in->variant.file_variant.file_size;
+		yaffs_oh_size_load(oh, file_size);
 		break;
 	case YAFFS_OBJECT_TYPE_HARDLINK:
 		oh->equiv_id = in->variant.hardlink_variant.equiv_id;
@@ -3373,7 +3368,7 @@ int yaffs_update_oh(struct yaffs_obj *in, const YCHAR *name, int force,
 	/* Add extra info for file header */
 	new_tags.extra_available = 1;
 	new_tags.extra_parent_id = oh->parent_obj_id;
-	new_tags.extra_length = oh->file_size;
+	new_tags.extra_file_size = file_size;
 	new_tags.extra_is_shrink = oh->is_shrink;
 	new_tags.extra_equiv_id = oh->equiv_id;
 	new_tags.extra_shadows = (oh->shadows_obj > 0) ? 1 : 0;
@@ -3502,7 +3497,7 @@ int yaffs_file_rd(struct yaffs_obj *in, u8 * buffer, loff_t offset, int n_bytes)
 }
 
 int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
-		     int n_bytes, int write_trhrough)
+		     int n_bytes, int write_through)
 {
 
 	int chunk;
@@ -3511,10 +3506,10 @@ int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
 	int n = n_bytes;
 	int n_done = 0;
 	int n_writeback;
-	int start_write = offset;
+	loff_t start_write = offset;
 	int chunk_written = 0;
 	u32 n_bytes_read;
-	u32 chunk_start;
+	loff_t chunk_start;
 	struct yaffs_dev *dev;
 
 	dev = in->my_dev;
@@ -3522,11 +3517,12 @@ int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
 	while (n > 0 && chunk_written >= 0) {
 		yaffs_addr_to_chunk(dev, offset, &chunk, &start);
 
-		if (chunk * dev->data_bytes_per_chunk + start != offset ||
+		if (((loff_t)chunk) *
+		    dev->data_bytes_per_chunk + start != offset ||
 		    start >= dev->data_bytes_per_chunk) {
 			yaffs_trace(YAFFS_TRACE_ERROR,
-				"AddrToChunk of offset %d gives chunk %d start %d",
-				(int)offset, chunk, start);
+				"AddrToChunk of offset %lld gives chunk %d start %d",
+				offset, chunk, start);
 		}
 		chunk++;	/* File pos to chunk in file offset */
 
@@ -3543,7 +3539,8 @@ int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
 			 * before.
 			 */
 
-			chunk_start = ((chunk - 1) * dev->data_bytes_per_chunk);
+			chunk_start = (((loff_t)(chunk - 1)) *
+					dev->data_bytes_per_chunk);
 
 			if (chunk_start > in->variant.file_variant.file_size)
 				n_bytes_read = 0;	/* Past end of file */
@@ -3611,7 +3608,7 @@ int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
 					cache->locked = 0;
 					cache->n_bytes = n_writeback;
 
-					if (write_trhrough) {
+					if (write_through) {
 						chunk_written =
 						    yaffs_wr_data_obj
 						    (cache->object,
@@ -3671,25 +3668,34 @@ int yaffs_do_file_wr(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
 }
 
 int yaffs_wr_file(struct yaffs_obj *in, const u8 *buffer, loff_t offset,
-		  int n_bytes, int write_trhrough)
+		  int n_bytes, int write_through)
 {
 	yaffs2_handle_hole(in, offset);
-	return yaffs_do_file_wr(in, buffer, offset, n_bytes, write_trhrough);
+	return yaffs_do_file_wr(in, buffer, offset, n_bytes, write_through);
 }
 
 /* ---------------------- File resizing stuff ------------------ */
 
-static void yaffs_prune_chunks(struct yaffs_obj *in, int new_size)
+static void yaffs_prune_chunks(struct yaffs_obj *in, loff_t new_size)
 {
 
 	struct yaffs_dev *dev = in->my_dev;
-	int old_size = in->variant.file_variant.file_size;
+	loff_t old_size = in->variant.file_variant.file_size;
 	int i;
 	int chunk_id;
-	int last_del = 1 + (old_size - 1) / dev->data_bytes_per_chunk;
-	int start_del = 1 + (new_size + dev->data_bytes_per_chunk - 1) /
-	    dev->data_bytes_per_chunk;
+	u32 dummy;
+	int last_del;
+	int start_del;
 
+	if (old_size > 0)
+		yaffs_addr_to_chunk(dev, old_size - 1, &last_del, &dummy);
+	else
+		last_del = 0;
+
+	yaffs_addr_to_chunk(dev, new_size + dev->data_bytes_per_chunk - 1,
+				&start_del, &dummy);
+	last_del++;
+	start_del++;
 
 	/* Delete backwards so that we don't end up with holes if
 	 * power is lost part-way through the operation.
@@ -3753,7 +3759,7 @@ void yaffs_resize_file_down(struct yaffs_obj *obj, loff_t new_size)
 int yaffs_resize_file(struct yaffs_obj *in, loff_t new_size)
 {
 	struct yaffs_dev *dev = in->my_dev;
-	int old_size = in->variant.file_variant.file_size;
+	loff_t old_size = in->variant.file_variant.file_size;
 
 	yaffs_flush_file_cache(in);
 	yaffs_invalidate_whole_cache(in);
@@ -3839,7 +3845,7 @@ static int yaffs_unlink_file_if_needed(struct yaffs_obj *in)
 	return ret_val;
 }
 
-int yaffs_del_file(struct yaffs_obj *in)
+static int yaffs_del_file(struct yaffs_obj *in)
 {
 	int ret_val = YAFFS_OK;
 	int deleted;	/* Need to cache value on stack if in is freed */
@@ -4068,6 +4074,12 @@ int yaffs_rename_obj(struct yaffs_obj *old_dir, const YCHAR *old_name,
 		strcmp(old_name, new_name) == 0)
 		force = 1;
 #endif
+
+	if (strnlen(new_name, YAFFS_MAX_NAME_LENGTH + 1) >
+	    YAFFS_MAX_NAME_LENGTH)
+		/* ENAMETOOLONG */
+		return YAFFS_FAIL;
+
 	if (old_name)
 		obj = yaffs_find_by_name(old_dir, old_name);
 	else{
@@ -4347,7 +4359,7 @@ struct yaffs_obj *yaffs_find_by_name(struct yaffs_obj *directory,
 			 */
 			yaffs_get_obj_name(l, buffer,
 				YAFFS_MAX_NAME_LENGTH + 1);
-			if (strncmp(name, buffer, YAFFS_MAX_NAME_LENGTH) == 0)
+			if (!strncmp(name, buffer, YAFFS_MAX_NAME_LENGTH))
 				return l;
 		}
 	}
@@ -4440,7 +4452,7 @@ int yaffs_get_obj_name(struct yaffs_obj *obj, YCHAR *name, int buffer_size)
 	return strnlen(name, YAFFS_MAX_NAME_LENGTH);
 }
 
-int yaffs_get_obj_length(struct yaffs_obj *obj)
+loff_t yaffs_get_obj_length(struct yaffs_obj *obj)
 {
 	/* Dereference any hard linking */
 	obj = yaffs_get_equivalent_obj(obj);
@@ -4807,7 +4819,7 @@ int yaffs_guts_initialise(struct yaffs_dev *dev)
 	if (!init_failed && !yaffs_create_initial_dir(dev))
 		init_failed = 1;
 
-	if(!init_failed && dev->param.is_yaffs2 &&
+	if (!init_failed && dev->param.is_yaffs2 &&
 		!dev->param.disable_summary &&
 		!yaffs_summary_init(dev))
 		init_failed = 1;
@@ -4874,7 +4886,7 @@ int yaffs_guts_initialise(struct yaffs_dev *dev)
 	dev->n_page_writes = 0;
 	dev->n_erasures = 0;
 	dev->n_gc_copies = 0;
-	dev->n_retired_writes = 0;
+	dev->n_retried_writes = 0;
 
 	dev->n_retired_blocks = 0;
 
@@ -4979,4 +4991,63 @@ int yaffs_get_n_free_chunks(struct yaffs_dev *dev)
 		n_free = 0;
 
 	return n_free;
+}
+
+
+int yaffs_format_dev(struct yaffs_dev *dev)
+{
+	int i;
+	enum yaffs_block_state state;
+	u32 dummy;
+
+	if(dev->is_mounted)
+		return YAFFS_FAIL;
+
+	/*
+	* The runtime variables might not have been set up,
+	* so set up what we need.
+	*/
+	dev->internal_start_block = dev->param.start_block;
+	dev->internal_end_block = dev->param.end_block;
+	dev->block_offset = 0;
+	dev->chunk_offset = 0;
+
+	if (dev->param.start_block == 0) {
+		dev->internal_start_block = dev->param.start_block + 1;
+		dev->internal_end_block = dev->param.end_block + 1;
+		dev->block_offset = 1;
+		dev->chunk_offset = dev->param.chunks_per_block;
+	}
+
+	for (i = dev->internal_start_block; i <= dev->internal_end_block; i++) {
+		yaffs_query_init_block_state(dev, i, &state, &dummy);
+		if (state != YAFFS_BLOCK_STATE_DEAD)
+			yaffs_erase_block(dev, i);
+	}
+
+	return YAFFS_OK;
+}
+
+
+/*
+ * Marshalling functions to get loff_t file sizes into and out of
+ * object headers.
+ */
+void yaffs_oh_size_load(struct yaffs_obj_hdr *oh, loff_t fsize)
+{
+	oh->file_size_low = (fsize & 0xFFFFFFFF);
+	oh->file_size_high = ((fsize >> 32) & 0xFFFFFFFF);
+}
+
+loff_t yaffs_oh_to_size(struct yaffs_obj_hdr *oh)
+{
+	loff_t retval;
+
+	if (sizeof(loff_t) >= 8 && ~(oh->file_size_high))
+		retval = (((loff_t) oh->file_size_high) << 32) |
+			(((loff_t) oh->file_size_low) & 0xFFFFFFFF);
+	else
+		retval = (loff_t) oh->file_size_low;
+
+	return retval;
 }
